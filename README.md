@@ -346,7 +346,7 @@ runs_usod10k_wavelet/
 └── segdino_s_384x384_usod10k_mamba_wav_ugbd/
     ├── ckpts/
     │   ├── latest.pth
-    │   └── best_Fw_beta_ep047_0.9200.pth
+    │   └── best_Fw_beta_ep068_0.9221.pth
     ├── metrics_history.csv
     └── model_profile.txt
 ```
@@ -360,7 +360,7 @@ python test_segdino.py \
   --data_dir ./segdata \
   --dataset usod10k \
   --dino_ckpt ./web_pth/dinov3_vits16_pretrain_lvd1689m-08c60483.pth \
-  --ckpt ./runs_usod10k_wavelet/segdino_s_384x384_usod10k_mamba_wav_ugbd/ckpts/best_Fw_beta_ep047_0.9200.pth \
+  --ckpt ./runs_usod10k_wavelet/segdino_s_384x384_usod10k_mamba_wav_ugbd/ckpts/best_Fw_beta_ep068_0.9221.pth \
   --dino_size s \
   --input_h 384 \
   --input_w 384 \
@@ -493,16 +493,19 @@ L_total = w_bce × L_BCE
 
 ### Performance on USOD10K Dataset
 
+**Best Model**: `best_Fw_beta_ep068_0.9221.pth` (Epoch 68)
+
 | Metric | Value |
 |--------|-------|
-| **MAE** | 0.0174 |
-| **mIoU** | 0.9200+ |
-| **S_alpha** | 0.9200+ |
-| **Fw_beta** | 0.9200 |
-| **mE_phi** | 0.9200+ |
-| **maxF** | 0.9200+ |
+| **MAE** | 0.0168 |
+| **mIoU** | 0.8730 |
+| **S_alpha** | 0.9273 |
+| **Fw_beta** | 0.9221 |
+| **mE_phi** | 0.9704 |
+| **E_phi_adp** | 0.9732 |
+| **maxF** | 0.9263 |
 
-*Results may vary based on training configuration and random seed.*
+*Results obtained with full training configuration including Wavelet losses, UGBD refiner, and SDF head. Training for 120 epochs with aggressive optimization settings.*
 
 ## 📝 Citation
 
