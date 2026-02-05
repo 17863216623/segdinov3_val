@@ -489,11 +489,15 @@ L_total = w_bce × L_BCE
 - **Eikonal Loss**: Gradient magnitude constraint
 - **Curvature Loss**: Smoothness constraint
 
-## 📈 Results
+## 📈 Results & Training Progress (`segdinov3_val`)
 
-### Performance on USOD10K Dataset
+This section summarizes the key experimental results and is designed to help you quickly track **where the model is**, **which configuration produced which metrics**, and **how MAE evolves after introducing an explicit validation split**.
 
-**Best Model**: `best_Fw_beta_ep068_0.9221.pth` (Epoch 68)
+### 1. Historical best (MAE ≈ 0.016, before explicit val split)
+
+This is the earlier best result (single USOD10K setup, without the dedicated `usod10k_val` split), corresponding to the aggressive training in `train_aggressive.sh`.
+
+**Best Model (USOD10K test)**: `best_Fw_beta_ep068_0.9221.pth` (Epoch 68)
 
 | Metric | Value |
 |--------|-------|
@@ -505,7 +509,77 @@ L_total = w_bce × L_BCE
 | **E_phi_adp** | 0.9732 |
 | **maxF** | 0.9263 |
 
-*Results obtained with full training configuration including Wavelet losses, UGBD refiner, and SDF head. Training for 120 epochs with aggressive optimization settings.*
+> 这组结果基本可以视为「MAE≈0.016 时的基准指标」，方便对比后续显式引入 `val` 划分与 MAE 直接优化后的变化。
+
+### 2. MAE-optimized run with explicit train/val/test split
+
+After introducing **direct MAE losses** and an explicit split:
+
+- **Train set**: `usod10k/train` — 7178 samples  
+- **Val set**: `usod10k_val` — 2051 samples  
+- **Test set**: `usod10k_test` — 1026 samples  
+
+The current MAE-optimized run (see `MAE_OPTIMIZATION.md` and `OPTIMIZATION_SUMMARY_MAE.md`) uses `BEST_METRIC="MAE"` and logs per-epoch validation metrics to:
+
+- `runs_usod10k_wavelet_0003/segdino_s_384x384_usod10k_mamba_wav_ugbd/metrics_history.csv`
+
+**Best on validation set (usod10k_val, monitored by MAE)**  
+`runs_usod10k_wavelet_0003/.../ckpts/best_MAE_ep025_0.0178.pth`
+
+| Metric | Value | Note |
+|--------|-------|------|
+| **Epoch** | 25 | Best `val_MAE` |
+| **val_MAE** | 0.0178 | Best MAE on `usod10k_val` |
+| **val_mIoU** | 0.8690 | Overall overlap on val set |
+| **val_S_alpha** | 0.9243 | Structure similarity on val set |
+| **val_Fw_beta** | 0.9178 | Weighted F-measure on val set |
+| **val_mE_phi** | 0.9673 | Mean E-measure on val set |
+| **val_E_phi_adp** | 0.9702 | Adaptive E-measure on val set |
+| **val_maxF** | 0.9223 | Max F-measure on val set |
+
+> 虽然 MAE 目前还略高于历史最佳 0.0168，但这组结果是在 **显式 train/val/test 划分 + MAE 直接优化** 下得到的，更适合作为后续调参与问题排查的参考基线。
+
+### 3. Multi-test-dataset evaluation after enabling val split
+
+For testing generalization across multiple datasets, use `test_all_checkpoints.py` or `test_one_click.sh` with:
+
+- `TEST_DATASETS="usod10k_test usod_test cod10k_test"` (see `MULTI_TEST_DATASETS.md`)
+- Results logged to:  
+  `runs_usod10k_wavelet/segdino_s_384x384_usod10k_mamba_wav_ugbd/test_results_all_ckpts.csv`
+
+An example checkpoint (`epoch_045`) after enabling the new evaluation pipeline yields:
+
+| Dataset | mIoU | maxF | MAE |
+|---------|------|------|-----|
+| **usod10k_test** | 0.8693 | 0.9286 | 0.0175 |
+| **usod_test** | 0.8521 | 0.9234 | 0.0182 |
+| **cod10k_test** | 0.8645 | 0.9256 | 0.0168 |
+| **Average** | 0.8619 | 0.9259 | 0.0175 |
+
+These numbers correspond to the example summarized in `MULTI_TEST_DATASETS.md`, and reflect the **multi-dataset test performance after introducing val/test separation**.
+
+### 4. How to track and update experiments (recommended workflow)
+
+To make it easy to debug and compare future runs:
+
+1. **During training**  
+   - Monitor `metrics_history.csv` in the corresponding `runs_*` directory.  
+   - Focus on `val_loss`, `mIoU`, `Fw_beta`, and `MAE` columns to see convergence and overfitting.
+
+2. **After testing**  
+   - Run:
+     - `./test_one_click.sh`  
+       or  
+     - `python test_all_checkpoints.py --dino_ckpt ... --ckpt_dir ... --data_dir ./segdata --dataset usod10k --test_datasets usod10k_test usod_test cod10k_test --output_csv test_results_all_ckpts.csv --use_ugbd --use_sdf`
+   - Check `test_results_all_ckpts.csv` for **per-epoch, per-dataset** metrics.
+
+3. **Updating this README (segdinov3_val)**  
+   - 每次有重要的新实验（比如 MAE 明显下降、或者引入新 loss/新数据集），建议：
+     - 记录：使用的脚本（例如 `train_one_click.sh` / `train_aggressive.sh`）、关键超参数改动；
+     - 从 `metrics_history.csv` 和 `test_results_all_ckpts.csv` 中拷贝对应 epoch 的 **val/test 指标**；
+     - 在本节的表格中新增一小节或一行，注明日期和简单备注（例如“加入更强数据增强”“调高 W_MAE”“换成 DINOv3-Base”等）。
+
+这样可以在 GitHub 仓库 `segdinov3_val` 中，一眼看到：**之前 MAE≈0.016 时的表现**、**当前显式 val + MAE 优化后的表现**，以及 **多测试集上的泛化情况**，方便你快速定位问题和规划下一步优化方向。
 
 ## 📝 Citation
 

@@ -139,6 +139,19 @@ def ssim_loss(prob, target):
         return 1 - (((2*mx*my+c1)*(2*cxy+c2))/(((mx*mx+my*my+c1)*(vx+vy+c2))+1e-12))
     return _local(prob,target).mean()
 
+def mae_loss(prob, target):
+    """MAE损失：直接优化平均绝对误差"""
+    return torch.abs(prob - target).mean()
+
+def focal_mae_loss(prob, target, alpha=0.25, gamma=2.0):
+    """
+    Focal MAE损失：对困难样本给予更多关注
+    - 对误差较大的像素给更高权重，有助于拉低整体MAE
+    """
+    mae = torch.abs(prob - target)
+    weight = torch.pow(mae, gamma)
+    return (alpha * weight * mae).mean()
+
 class EMA:
     def __init__(self, model, decay=0.996):
         self.decay=decay; self.shadow={}
@@ -150,13 +163,21 @@ class EMA:
             if p.requires_grad:
                 self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0-self.decay)
 
-def build_scheduler(optimizer, total_epochs, warmup_epochs=8, sched="cosine"):
-    def lr_lambda(e):
-        if e < warmup_epochs: 
-            return float(e+1)/float(max(1,warmup_epochs))
-        t = e - warmup_epochs; T = max(1,total_epochs-warmup_epochs)
-        return 0.5*(1.0+math.cos(math.pi*t/T)) if sched=="cosine" else 1.0
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+def build_scheduler(optimizer, total_epochs, warmup_epochs=8, sched="cosine", patience=15, factor=0.5, min_lr=1e-6):
+    if sched == "plateau":
+        # 使用ReduceLROnPlateau，需要手动step
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=factor, patience=patience,
+            verbose=True, min_lr=min_lr
+        ), "plateau"
+    else:
+        def lr_lambda(e):
+            if e < warmup_epochs:
+                return float(e+1)/float(max(1, warmup_epochs))
+            t = e - warmup_epochs
+            T = max(1, total_epochs - warmup_epochs)
+            return 0.5*(1.0+math.cos(math.pi*t/T)) if sched == "cosine" else 1.0
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda), "lambda"
 
 # ----------------- 复杂度/参数量 -----------------
 class CombinedForProfile(nn.Module):
@@ -220,33 +241,56 @@ def train_one_epoch(backbone, decoder, loader, optimizer, device, epoch, args, r
             logits, sdf_map = sdf_head(imgs, logits)
 
         prob = torch.sigmoid(logits)
+
+        # ---------------- 动态损失权重（后期微调，更关注MAE，减弱正则） ----------------
+        phase = float(epoch) / float(max(1, args.epochs))
+        mae_boost = 1.0
+        reg_scale = 1.0
+        if phase >= getattr(args, "late_ft_start", 1.1):  # 默认>1表示不开启
+            t = (phase - args.late_ft_start) / max(1e-6, 1.0 - args.late_ft_start)
+            mae_boost = 1.0 + t * (args.late_ft_mae_boost - 1.0)
+            reg_scale = 1.0 - t * (1.0 - args.late_ft_reg_decay)
+
         loss = 0.0
+        # 主体分类/重叠相关损失
         loss += bce(logits,gts) * args.w_bce
         loss += (dice_loss(prob,gts) if args.use_dice else iou_loss(prob,gts)) * args.w_iou
         loss += ssim_loss(prob,gts) * args.w_ssim
-        if args.use_wavelet:
-            loss += wavelet_detail_loss(prob,gts,levels=args.wav_levels) * args.w_wav
-            loss += wavelet_edge_dice(prob,gts,levels=args.wav_levels)   * args.w_wed
-            loss += tv_l1_loss(prob)                                     * args.w_tv
-            loss += boundary_focal_bce_loss(logits,gts,lam=args.bf_lam)  * args.w_bfce
-        if args.w_cldice>0:
-            loss += args.w_cldice * cldice_loss(logits, gts)
-        
-        # 边界相关损失（关键：提升Fwβ）
-        if args.w_biou > 0:
-            loss += args.w_biou * boundary_iou_loss_from_probs(prob, gts)
-        if args.w_uwb > 0:
-            loss += args.w_uwb * uncertainty_weighted_boundary_loss(prob, gts, lam=args.uwb_lam)
-        if args.w_freq > 0:
-            loss += args.w_freq * fourier_mag_loss(prob, gts, log_mag=args.freq_log, highfreq_boost=args.freq_hf_boost)
 
-        # SDF 形状先验损失
+        # 正则 & 细节/边界相关损失（在后期会适当衰减）
+        if args.use_wavelet:
+            loss += wavelet_detail_loss(prob,gts,levels=args.wav_levels) * args.w_wav * reg_scale
+            loss += wavelet_edge_dice(prob,gts,levels=args.wav_levels)   * args.w_wed * reg_scale
+            loss += tv_l1_loss(prob)                                     * args.w_tv * reg_scale
+            loss += boundary_focal_bce_loss(logits,gts,lam=args.bf_lam)  * args.w_bfce * reg_scale
+        if args.w_cldice>0:
+            loss += args.w_cldice * cldice_loss(logits, gts) * reg_scale
+        
+        # 边界相关损失（关键：提升Fwβ，同样在后期适当衰减）
+        if args.w_biou > 0:
+            loss += args.w_biou * boundary_iou_loss_from_probs(prob, gts) * reg_scale
+        if args.w_uwb > 0:
+            loss += args.w_uwb * uncertainty_weighted_boundary_loss(prob, gts, lam=args.uwb_lam) * reg_scale
+        if args.w_freq > 0:
+            loss += args.w_freq * fourier_mag_loss(prob, gts, log_mag=args.freq_log, highfreq_boost=args.freq_hf_boost) * reg_scale
+        
+        # MAE相关损失（直接优化MAE指标，在后期被放大）
+        if args.w_mae > 0:
+            loss += args.w_mae * mae_loss(prob, gts) * mae_boost
+        if args.w_focal_mae > 0:
+            loss += args.w_focal_mae * focal_mae_loss(
+                prob, gts,
+                alpha=getattr(args, "focal_mae_alpha", 0.25),
+                gamma=getattr(args, "focal_mae_gamma", 2.0),
+            ) * mae_boost
+
+        # SDF 形状先验损失（视为一种几何正则，在后期适当衰减）
         if (sdf_head is not None) and (sdf_map is not None):
             with torch.no_grad():
                 sdf_gt = batch_build_sdf(gts, scale=args.sdf_scale)
-            loss += args.w_sdf * nn.functional.l1_loss(sdf_map, sdf_gt)
-            loss += args.w_eik * eikonal_loss(sdf_map)
-            loss += args.w_curv * curvature_loss(sdf_map)
+            loss += args.w_sdf * nn.functional.l1_loss(sdf_map, sdf_gt) * reg_scale
+            loss += args.w_eik * eikonal_loss(sdf_map) * reg_scale
+            loss += args.w_curv * curvature_loss(sdf_map) * reg_scale
         loss.backward()
         # 梯度裁剪
         if args.grad_clip > 0:
@@ -356,6 +400,19 @@ def main():
     parser.add_argument("--w_freq", type=float, default=0.0, help="Fourier magnitude loss weight")
     parser.add_argument("--freq_log", action="store_true", help="Use log magnitude in Fourier loss")
     parser.add_argument("--freq_hf_boost", type=float, default=0.2, help="High frequency boost in Fourier loss")
+    # MAE相关损失（优化MAE指标）
+    parser.add_argument("--w_mae", type=float, default=0.0, help="MAE loss weight (direct optimization)")
+    parser.add_argument("--w_focal_mae", type=float, default=0.0, help="Focal MAE loss weight")
+    parser.add_argument("--focal_mae_alpha", type=float, default=0.25, help="Focal MAE alpha")
+    parser.add_argument("--focal_mae_gamma", type=float, default=2.0, help="Focal MAE gamma")
+    # 分阶段微调（后期更关注MAE，减弱正则）
+    # 注意：这里默认策略较“温和”，避免过度牺牲泛化，只做小幅MAE精修
+    parser.add_argument("--late_ft_start", type=float, default=0.8,
+                        help="进入后期微调阶段的起始比例，例如0.8表示80%% epoch之后")
+    parser.add_argument("--late_ft_mae_boost", type=float, default=1.2,
+                        help="后期阶段对MAE类损失的放大倍数")
+    parser.add_argument("--late_ft_reg_decay", type=float, default=0.5,
+                        help="后期阶段对正则/边界类损失的小数倍缩放系数")
 
     # 数据增强
     parser.add_argument("--use_aug", action="store_true", help="启用训练时数据增强")
@@ -371,10 +428,17 @@ def main():
     # 训练器
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine","constant"])
+    parser.add_argument("--scheduler", type=str, default="cosine", choices=["cosine","constant","plateau"])
     parser.add_argument("--warmup_epochs", type=int, default=8)
     parser.add_argument("--use_ema", action="store_true")
     parser.add_argument("--ema_decay", type=float, default=0.996)
+    # 早停和学习率调度
+    parser.add_argument("--early_stop", type=int, default=0, help="早停轮数，0表示禁用")
+    parser.add_argument("--patience", type=int, default=15, help="ReduceLROnPlateau的patience")
+    parser.add_argument("--lr_factor", type=float, default=0.5, help="学习率衰减因子")
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="最小学习率")
+    # 保存策略
+    parser.add_argument("--save_every_epoch", action="store_true", help="保存每个epoch的权重")
 
     # 存储
     parser.add_argument("--save_root", type=str, default="./runs_usod10k_wavelet")
@@ -435,18 +499,42 @@ def main():
     if sdf_head is not None:
         params += list(sdf_head.parameters())
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, params), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = build_scheduler(optimizer, total_epochs=args.epochs, warmup_epochs=args.warmup_epochs, sched=args.scheduler)
+    scheduler, sched_type = build_scheduler(
+        optimizer, total_epochs=args.epochs, warmup_epochs=args.warmup_epochs, 
+        sched=args.scheduler, patience=args.patience, factor=args.lr_factor, min_lr=args.min_lr
+    )
     ema = EMA(backbone, decay=args.ema_decay) if args.use_ema else None
 
     # 数据
     H,W = args.input_h, args.input_w
     train_root = os.path.join(args.data_dir, args.dataset)
-    alt_val_root = os.path.join(args.data_dir, args.dataset.rstrip("/") + "_test")
-    val_root = alt_val_root if os.path.isdir(alt_val_root) else train_root
+    
+    # 验证集：优先使用独立的 val 目录（如 usod10k_val），如果没有则尝试 train_root 下的 val 子目录，
+    # 再不行则回退到 *_test 或 train_root 本身（向后兼容旧数据结构）
+    val_root = os.path.join(args.data_dir, args.dataset.rstrip("/") + "_val")
+    val_split = "val"
+    if not os.path.isdir(val_root):
+        # 尝试 train_root 下的 val 子目录
+        candidate = os.path.join(train_root, "val")
+        if os.path.isdir(candidate):
+            val_root = train_root
+            val_split = "val"
+        else:
+            # 如果都没有，使用 *_test 或 train_root 作为验证集（兼容旧版）
+            alt_val_root = os.path.join(args.data_dir, args.dataset.rstrip("/") + "_test")
+            if os.path.isdir(alt_val_root):
+                val_root = alt_val_root
+                val_split = "test"
+            else:
+                val_root = train_root
+                val_split = "test"
+    
     train_set = SmartFolderDataset(train_root, "train", args.img_dir_name, args.label_dir_name, args.img_ext, args.mask_ext, (H,W), use_aug=args.use_aug)
-    val_set   = SmartFolderDataset(val_root,   "test",  args.img_dir_name, args.label_dir_name, args.img_ext, args.mask_ext, (H,W), use_aug=False)
+    # 验证集仅用于每轮评估，不参与训练
+    val_set   = SmartFolderDataset(val_root, val_split, args.img_dir_name, args.label_dir_name, args.img_ext, args.mask_ext, (H,W), use_aug=False)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True, pin_memory=True)
     val_loader   = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=max(1,args.num_workers//2), drop_last=False, pin_memory=True)
+    print(f"[Dataset] Train: {len(train_set)} samples, Val: {len(val_set)} samples (from '{val_root}', split='{val_split}')")
 
     # CSV 头
     if not os.path.exists(csv_path):
@@ -459,6 +547,10 @@ def main():
     best_ckpt=""; 
     def better(new, old, key): return (new<old) if key=="MAE" else (new>old)
 
+    # 早停相关
+    no_improve_count = 0
+    best_metric_value = -1e9 if args.best_metric != "MAE" else 1e9
+
     # 训练循环
     for e in range(1, args.epochs+1):
         tloss = train_one_epoch(backbone, decoder, train_loader, optimizer, device, e, args, refine=refine, sdf_head=sdf_head)
@@ -470,11 +562,24 @@ def main():
             "decoder": decoder.state_dict(),
             "optimizer": optimizer.state_dict(),
         }
+        # 保存scheduler状态（如果支持）
+        if hasattr(scheduler, 'state_dict'):
+            try:
+                state["scheduler"] = scheduler.state_dict()
+            except:
+                pass
         if refine is not None:
             state["refine"] = refine.state_dict()
         if sdf_head is not None:
             state["sdf_head"] = sdf_head.state_dict()
+        
+        # 保存latest
         torch.save(state, os.path.join(ckpt_dir,"latest.pth"))
+        
+        # 保存每个epoch的权重（如果启用）
+        if args.save_every_epoch:
+            epoch_ckpt = os.path.join(ckpt_dir, f"epoch_{e:03d}.pth")
+            torch.save(state, epoch_ckpt)
 
         key=args.best_metric; val_key = val[key]
         if better(val_key, best[key][0], key):
@@ -482,17 +587,31 @@ def main():
             best_ckpt=os.path.join(ckpt_dir, f"best_{key}_ep{e:03d}_{val_key:.4f}.pth")
             torch.save(state, best_ckpt)
             print(f"[Save] New best ({key}): {best_ckpt}")
+            no_improve_count = 0  # 重置早停计数
+        else:
+            no_improve_count += 1
 
         for k in ["mIoU","S_alpha","Fw_beta","mE_phi","maxF"]:
             if val[k]>best[k][0]: best[k]=(val[k],e)
         if val["MAE"]<best["MAE"][0]: best["MAE"]=(val["MAE"],e)
+
+        # 学习率调度
+        if sched_type == "plateau":
+            # ReduceLROnPlateau需要传入验证指标
+            scheduler.step(val[args.best_metric])
+        else:
+            scheduler.step()
 
         with open(csv_path,"a",newline="") as f:
             csv.writer(f).writerow([e, f"{optimizer.param_groups[0]['lr']:.6e}", f"{tloss:.6f}",
                                     f"{val['val_loss']:.6f}", f"{val['mIoU']:.6f}", f"{val['S_alpha']:.6f}",
                                     f"{val['Fw_beta']:.6f}", f"{val['mE_phi']:.6f}", f"{val['E_phi_adp']:.6f}",
                                     f"{val['MAE']:.6f}", f"{val['maxF']:.6f}", best_ckpt])
-        scheduler.step()
+        
+        # 早停检查
+        if args.early_stop > 0 and no_improve_count >= args.early_stop:
+            print(f"[Early Stop] No improvement for {args.early_stop} epochs. Stopping training.")
+            break
 
     print("="*66)
     print("[Summary] Best over all epochs (Dual-SAM metrics):")
