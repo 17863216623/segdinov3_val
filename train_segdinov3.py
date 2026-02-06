@@ -153,15 +153,42 @@ def focal_mae_loss(prob, target, alpha=0.25, gamma=2.0):
     return (alpha * weight * mae).mean()
 
 class EMA:
-    def __init__(self, model, decay=0.996):
-        self.decay=decay; self.shadow={}
-        for n,p in model.named_parameters():
-            if p.requires_grad: self.shadow[n]=p.detach().clone()
+    def __init__(self, model, decay=0.996, name_prefix=""):
+        self.decay = decay
+        self.shadow = {}
+        self.name_prefix = name_prefix
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[f"{self.name_prefix}{n}"] = p.detach().clone()
+
     @torch.no_grad()
     def update(self, model):
-        for n,p in model.named_parameters():
+        for n, p in model.named_parameters():
             if p.requires_grad:
-                self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1.0-self.decay)
+                key = f"{self.name_prefix}{n}"
+                if key not in self.shadow:
+                    self.shadow[key] = p.detach().clone()
+                else:
+                    self.shadow[key].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model):
+        backup = {}
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                key = f"{self.name_prefix}{n}"
+                if key in self.shadow:
+                    backup[key] = p.detach().clone()
+                    p.copy_(self.shadow[key])
+        return backup
+
+    @torch.no_grad()
+    def restore(self, model, backup):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                key = f"{self.name_prefix}{n}"
+                if key in backup:
+                    p.copy_(backup[key])
 
 def build_scheduler(optimizer, total_epochs, warmup_epochs=8, sched="cosine", patience=15, factor=0.5, min_lr=1e-6):
     if sched == "plateau":
@@ -250,6 +277,17 @@ def train_one_epoch(backbone, decoder, loader, optimizer, device, epoch, args, r
             t = (phase - args.late_ft_start) / max(1e-6, 1.0 - args.late_ft_start)
             mae_boost = 1.0 + t * (args.late_ft_mae_boost - 1.0)
             reg_scale = 1.0 - t * (1.0 - args.late_ft_reg_decay)
+        # MAE/正则分段 ramp（更平滑且可控）
+        mae_ramp = 1.0
+        if args.mae_ramp_end > args.mae_ramp_start:
+            t = (phase - args.mae_ramp_start) / max(1e-6, args.mae_ramp_end - args.mae_ramp_start)
+            mae_ramp = float(np.clip(t, 0.0, 1.0))
+            mae_ramp = 1.0 + mae_ramp * (args.mae_ramp_max - 1.0)
+        reg_ramp = 1.0
+        if args.reg_ramp_end > args.reg_ramp_start:
+            t = (phase - args.reg_ramp_start) / max(1e-6, args.reg_ramp_end - args.reg_ramp_start)
+            reg_ramp = float(np.clip(t, 0.0, 1.0))
+            reg_ramp = 1.0 - reg_ramp * (1.0 - args.reg_ramp_min)
 
         loss = 0.0
         # 主体分类/重叠相关损失
@@ -259,38 +297,54 @@ def train_one_epoch(backbone, decoder, loader, optimizer, device, epoch, args, r
 
         # 正则 & 细节/边界相关损失（在后期会适当衰减）
         if args.use_wavelet:
-            loss += wavelet_detail_loss(prob,gts,levels=args.wav_levels) * args.w_wav * reg_scale
-            loss += wavelet_edge_dice(prob,gts,levels=args.wav_levels)   * args.w_wed * reg_scale
-            loss += tv_l1_loss(prob)                                     * args.w_tv * reg_scale
-            loss += boundary_focal_bce_loss(logits,gts,lam=args.bf_lam)  * args.w_bfce * reg_scale
+            loss += wavelet_detail_loss(prob,gts,levels=args.wav_levels) * args.w_wav * reg_scale * reg_ramp
+            loss += wavelet_edge_dice(prob,gts,levels=args.wav_levels)   * args.w_wed * reg_scale * reg_ramp
+            loss += tv_l1_loss(prob)                                     * args.w_tv * reg_scale * reg_ramp
+            loss += boundary_focal_bce_loss(logits,gts,lam=args.bf_lam)  * args.w_bfce * reg_scale * reg_ramp
         if args.w_cldice>0:
-            loss += args.w_cldice * cldice_loss(logits, gts) * reg_scale
+            loss += args.w_cldice * cldice_loss(logits, gts) * reg_scale * reg_ramp
         
         # 边界相关损失（关键：提升Fwβ，同样在后期适当衰减）
         if args.w_biou > 0:
-            loss += args.w_biou * boundary_iou_loss_from_probs(prob, gts) * reg_scale
+            loss += args.w_biou * boundary_iou_loss_from_probs(prob, gts) * reg_scale * reg_ramp
         if args.w_uwb > 0:
-            loss += args.w_uwb * uncertainty_weighted_boundary_loss(prob, gts, lam=args.uwb_lam) * reg_scale
+            loss += args.w_uwb * uncertainty_weighted_boundary_loss(prob, gts, lam=args.uwb_lam) * reg_scale * reg_ramp
         if args.w_freq > 0:
-            loss += args.w_freq * fourier_mag_loss(prob, gts, log_mag=args.freq_log, highfreq_boost=args.freq_hf_boost) * reg_scale
+            loss += args.w_freq * fourier_mag_loss(prob, gts, log_mag=args.freq_log, highfreq_boost=args.freq_hf_boost) * reg_scale * reg_ramp
         
         # MAE相关损失（直接优化MAE指标，在后期被放大）
         if args.w_mae > 0:
-            loss += args.w_mae * mae_loss(prob, gts) * mae_boost
+            loss += args.w_mae * mae_loss(prob, gts) * mae_boost * mae_ramp
         if args.w_focal_mae > 0:
             loss += args.w_focal_mae * focal_mae_loss(
                 prob, gts,
                 alpha=getattr(args, "focal_mae_alpha", 0.25),
                 gamma=getattr(args, "focal_mae_gamma", 2.0),
-            ) * mae_boost
+            ) * mae_boost * mae_ramp
+
+        # 多尺度深监督（稳定收敛，提升细粒度一致性）
+        if args.use_deep_supervision and args.ds_scales_list:
+            for scale in args.ds_scales_list:
+                if scale == 1.0:
+                    continue
+                logits_ds = nn.functional.interpolate(
+                    logits, scale_factor=scale, mode="bilinear", align_corners=False
+                )
+                gts_ds = nn.functional.interpolate(gts, scale_factor=scale, mode="nearest")
+                prob_ds = torch.sigmoid(logits_ds)
+                ds_loss = bce(logits_ds, gts_ds) * args.ds_w_bce
+                ds_loss += (
+                    dice_loss(prob_ds, gts_ds) if args.use_dice else iou_loss(prob_ds, gts_ds)
+                ) * args.ds_w_iou
+                loss += args.ds_weight * ds_loss
 
         # SDF 形状先验损失（视为一种几何正则，在后期适当衰减）
         if (sdf_head is not None) and (sdf_map is not None):
             with torch.no_grad():
                 sdf_gt = batch_build_sdf(gts, scale=args.sdf_scale)
-            loss += args.w_sdf * nn.functional.l1_loss(sdf_map, sdf_gt) * reg_scale
-            loss += args.w_eik * eikonal_loss(sdf_map) * reg_scale
-            loss += args.w_curv * curvature_loss(sdf_map) * reg_scale
+            loss += args.w_sdf * nn.functional.l1_loss(sdf_map, sdf_gt) * reg_scale * reg_ramp
+            loss += args.w_eik * eikonal_loss(sdf_map) * reg_scale * reg_ramp
+            loss += args.w_curv * curvature_loss(sdf_map) * reg_scale * reg_ramp
         loss.backward()
         # 梯度裁剪
         if args.grad_clip > 0:
@@ -413,10 +467,34 @@ def main():
                         help="后期阶段对MAE类损失的放大倍数")
     parser.add_argument("--late_ft_reg_decay", type=float, default=0.5,
                         help="后期阶段对正则/边界类损失的小数倍缩放系数")
+    # 更平滑的 MAE/正则 ramp（用于长训练，避免后期震荡）
+    parser.add_argument("--mae_ramp_start", type=float, default=1.1,
+                        help="MAE ramp 开始比例（>1表示关闭）")
+    parser.add_argument("--mae_ramp_end", type=float, default=1.1,
+                        help="MAE ramp 结束比例（>1表示关闭）")
+    parser.add_argument("--mae_ramp_max", type=float, default=1.0,
+                        help="MAE ramp 最大放大倍数")
+    parser.add_argument("--reg_ramp_start", type=float, default=1.1,
+                        help="正则 ramp 开始比例（>1表示关闭）")
+    parser.add_argument("--reg_ramp_end", type=float, default=1.1,
+                        help="正则 ramp 结束比例（>1表示关闭）")
+    parser.add_argument("--reg_ramp_min", type=float, default=1.0,
+                        help="正则 ramp 最小缩放系数")
 
     # 数据增强
     parser.add_argument("--use_aug", action="store_true", help="启用训练时数据增强")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值，0表示禁用")
+    # 多尺度深监督
+    parser.add_argument("--use_deep_supervision", action="store_true",
+                        help="Enable multi-scale deep supervision loss")
+    parser.add_argument("--ds_scales", type=str, default="0.5,0.25",
+                        help="Comma-separated scales for deep supervision")
+    parser.add_argument("--ds_weight", type=float, default=0.3,
+                        help="Overall deep supervision loss weight")
+    parser.add_argument("--ds_w_bce", type=float, default=1.0,
+                        help="BCE weight for deep supervision")
+    parser.add_argument("--ds_w_iou", type=float, default=0.5,
+                        help="IoU/Dice weight for deep supervision")
 
     # 评测
     parser.add_argument("--dual_sam_eval", action="store_true")
@@ -432,6 +510,21 @@ def main():
     parser.add_argument("--warmup_epochs", type=int, default=8)
     parser.add_argument("--use_ema", action="store_true")
     parser.add_argument("--ema_decay", type=float, default=0.996)
+    parser.add_argument("--use_ema_eval", action="store_true", help="Eval with EMA weights for stability")
+    parser.add_argument("--freeze_backbone_epochs", type=int, default=0,
+                        help="Freeze backbone for first N epochs to stabilize decoder training")
+    parser.add_argument("--use_two_stage", action="store_true",
+                        help="Enable two-stage training with backbone freeze warmup")
+    parser.add_argument("--stage1_ratio", type=float, default=0.0,
+                        help="Stage1 ratio for backbone freeze when --use_two_stage is set (0-1)")
+    parser.add_argument("--backbone_lr_mult", type=float, default=0.1,
+                        help="Backbone learning rate multiplier relative to --lr")
+    parser.add_argument("--mae_collapse_tol", type=float, default=0.35,
+                        help="MAE collapse tolerance ratio to trigger recovery (e.g. 0.35 = 35%% worse)")
+    parser.add_argument("--mae_collapse_lr_factor", type=float, default=0.5,
+                        help="LR decay factor applied when MAE collapse is detected")
+    parser.add_argument("--mae_collapse_restore", action="store_true",
+                        help="Restore best checkpoint weights when MAE collapse is detected")
     # 早停和学习率调度
     parser.add_argument("--early_stop", type=int, default=0, help="早停轮数，0表示禁用")
     parser.add_argument("--patience", type=int, default=15, help="ReduceLROnPlateau的patience")
@@ -445,6 +538,12 @@ def main():
     parser.add_argument("--best_metric", type=str, default="Fw_beta",
                         choices=["mIoU","S_alpha","Fw_beta","mE_phi","MAE","maxF"])
     args = parser.parse_args()
+    if args.use_deep_supervision:
+        args.ds_scales_list = [
+            float(s.strip()) for s in args.ds_scales.split(",") if s.strip()
+        ]
+    else:
+        args.ds_scales_list = []
 
     # 随机性
     torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
@@ -493,17 +592,30 @@ def main():
     dump_profile(exp_root, total_p, train_p, gmacs, gflops)
 
     # 优化器 & 调度 & EMA
-    params = list(backbone.parameters()) + list(decoder.parameters())
+    optimizer_groups = [
+        {"params": backbone.parameters(), "lr": args.lr * args.backbone_lr_mult},
+        {"params": decoder.parameters(), "lr": args.lr},
+    ]
     if refine is not None:
-        params += list(refine.parameters())
+        optimizer_groups.append({"params": refine.parameters(), "lr": args.lr})
     if sdf_head is not None:
-        params += list(sdf_head.parameters())
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, params), lr=args.lr, weight_decay=args.weight_decay)
+        optimizer_groups.append({"params": sdf_head.parameters(), "lr": args.lr})
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [p for p in group["params"] if p.requires_grad], "lr": group["lr"]}
+            for group in optimizer_groups
+        ],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     scheduler, sched_type = build_scheduler(
         optimizer, total_epochs=args.epochs, warmup_epochs=args.warmup_epochs, 
         sched=args.scheduler, patience=args.patience, factor=args.lr_factor, min_lr=args.min_lr
     )
-    ema = EMA(backbone, decay=args.ema_decay) if args.use_ema else None
+    ema_backbone = EMA(backbone, decay=args.ema_decay, name_prefix="backbone.") if args.use_ema else None
+    ema_decoder = EMA(decoder, decay=args.ema_decay, name_prefix="decoder.") if args.use_ema else None
+    ema_refine = EMA(refine, decay=args.ema_decay, name_prefix="refine.") if (args.use_ema and refine is not None) else None
+    ema_sdf = EMA(sdf_head, decay=args.ema_decay, name_prefix="sdf_head.") if (args.use_ema and sdf_head is not None) else None
 
     # 数据
     H,W = args.input_h, args.input_w
@@ -546,15 +658,52 @@ def main():
     best = {"mIoU":(-1,-1),"S_alpha":(-1,-1),"Fw_beta":(-1,-1),"mE_phi":(-1,-1),"MAE":(1e9,-1),"maxF":(-1,-1)}
     best_ckpt=""; 
     def better(new, old, key): return (new<old) if key=="MAE" else (new>old)
+    best_state = None
 
     # 早停相关
     no_improve_count = 0
     best_metric_value = -1e9 if args.best_metric != "MAE" else 1e9
 
     # 训练循环
+    freeze_epochs = args.freeze_backbone_epochs
+    if args.use_two_stage and freeze_epochs <= 0 and args.stage1_ratio > 0:
+        freeze_epochs = max(1, int(round(args.epochs * args.stage1_ratio)))
     for e in range(1, args.epochs+1):
+        if args.freeze_backbone_epochs > 0:
+            freeze_backbone = e <= args.freeze_backbone_epochs
+        elif freeze_epochs > 0:
+            freeze_backbone = e <= freeze_epochs
+        else:
+            freeze_backbone = False
+        if freeze_epochs > 0 and e == 1:
+            print(f"[Two-Stage] Freeze backbone for {freeze_epochs} epochs.")
+        if freeze_epochs > 0 and e == freeze_epochs + 1:
+            print("[Two-Stage] Unfreeze backbone for full finetune.")
+        for p in backbone.parameters():
+            p.requires_grad = not freeze_backbone
         tloss = train_one_epoch(backbone, decoder, train_loader, optimizer, device, e, args, refine=refine, sdf_head=sdf_head)
-        val = evaluate_with_module(backbone, decoder, val_loader, device, args, refine=refine, sdf_head=sdf_head)
+        if args.use_ema:
+            ema_backbone.update(backbone)
+            ema_decoder.update(decoder)
+            if ema_refine is not None:
+                ema_refine.update(refine)
+            if ema_sdf is not None:
+                ema_sdf.update(sdf_head)
+
+        if args.use_ema_eval and args.use_ema:
+            bk = ema_backbone.apply_shadow(backbone)
+            dk = ema_decoder.apply_shadow(decoder)
+            rk = ema_refine.apply_shadow(refine) if ema_refine is not None else None
+            sk = ema_sdf.apply_shadow(sdf_head) if ema_sdf is not None else None
+            val = evaluate_with_module(backbone, decoder, val_loader, device, args, refine=refine, sdf_head=sdf_head)
+            ema_backbone.restore(backbone, bk)
+            ema_decoder.restore(decoder, dk)
+            if ema_refine is not None and rk is not None:
+                ema_refine.restore(refine, rk)
+            if ema_sdf is not None and sk is not None:
+                ema_sdf.restore(sdf_head, sk)
+        else:
+            val = evaluate_with_module(backbone, decoder, val_loader, device, args, refine=refine, sdf_head=sdf_head)
 
         state = {
             "epoch": e,
@@ -588,6 +737,13 @@ def main():
             torch.save(state, best_ckpt)
             print(f"[Save] New best ({key}): {best_ckpt}")
             no_improve_count = 0  # 重置早停计数
+            best_state = {
+                "backbone": backbone.state_dict(),
+                "decoder": decoder.state_dict(),
+                "refine": refine.state_dict() if refine is not None else None,
+                "sdf_head": sdf_head.state_dict() if sdf_head is not None else None,
+                "optimizer": optimizer.state_dict(),
+            }
         else:
             no_improve_count += 1
 
@@ -607,6 +763,24 @@ def main():
                                     f"{val['val_loss']:.6f}", f"{val['mIoU']:.6f}", f"{val['S_alpha']:.6f}",
                                     f"{val['Fw_beta']:.6f}", f"{val['mE_phi']:.6f}", f"{val['E_phi_adp']:.6f}",
                                     f"{val['MAE']:.6f}", f"{val['maxF']:.6f}", best_ckpt])
+
+        # MAE collapse recovery: restore best and reduce LR if MAE worsens sharply
+        if args.mae_collapse_tol > 0 and best["MAE"][0] < 1e8:
+            collapse_threshold = best["MAE"][0] * (1.0 + args.mae_collapse_tol)
+            if val["MAE"] > collapse_threshold:
+                print(f"[MAE Collapse] val MAE={val['MAE']:.4f} > {collapse_threshold:.4f}.")
+                if args.mae_collapse_restore and best_state is not None:
+                    backbone.load_state_dict(best_state["backbone"])
+                    decoder.load_state_dict(best_state["decoder"])
+                    if refine is not None and best_state["refine"] is not None:
+                        refine.load_state_dict(best_state["refine"])
+                    if sdf_head is not None and best_state["sdf_head"] is not None:
+                        sdf_head.load_state_dict(best_state["sdf_head"])
+                    optimizer.load_state_dict(best_state["optimizer"])
+                    print("[MAE Collapse] Restored best checkpoint weights.")
+                for group in optimizer.param_groups:
+                    group["lr"] = max(group["lr"] * args.mae_collapse_lr_factor, args.min_lr)
+                print(f"[MAE Collapse] Reduce LR by factor {args.mae_collapse_lr_factor}.")
         
         # 早停检查
         if args.early_stop > 0 and no_improve_count >= args.early_stop:
